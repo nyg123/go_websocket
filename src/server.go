@@ -4,15 +4,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	idworker "github.com/gitstliu/go-id-worker"
 	"github.com/golang/glog"
 	"github.com/gorilla/websocket"
-	impl2 "go_websocket/src/impl"
+	"github.com/jinzhu/configor"
+	"main/tool"
 	"net/http"
+	"runtime"
+	"strconv"
 )
 
 const (
 	EventHeartBeat = "heartbeat"
 )
+
+var configPath = flag.String("c", "conf.json", "配置文件")
 
 var (
 	upgrader = websocket.Upgrader{
@@ -20,50 +26,72 @@ var (
 			return true
 		},
 	}
-	hub = impl2.NewHub()
+	hub        = tool.NewHub()
+	CurrWorker = &idworker.IdWorker{}
 )
 
-var port = flag.String("port", "80", "端口号")
-var certFile = flag.String("certFile", "", "cert文件路径")
-var keyFile = flag.String("keyFile", "", "key文件路径")
+var Config = struct {
+	Port     string `default:"80"`
+	TLS      bool   `default:"false"`
+	CertFile string
+	KeyFile  string
+}{}
+
+func init() {
+	//初始化命令行参数
+	flag.Parse()
+	err := configor.Load(&Config, *configPath)
+	if err != nil {
+		panic(err)
+	}
+	err = CurrWorker.InitIdWorker(1000, 1)
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
 	//初始化命令行参数
 	flag.Parse()
 	defer glog.Flush()
-	glog.Infoln("开始启动")
+	glog.Infoln("Start ...")
 	go hub.Run()
-	glog.Infoln("启动处理消息协程完成")
 	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/sendById", sendId)
+	http.HandleFunc("/sendById", sendById)
 	http.HandleFunc("/sendByRoom", sendRoom)
-	glog.Infoln("绑定路由完成")
-	url := fmt.Sprintf("0.0.0.0:%s", *port)
-	glog.Infoln("启动服务：", url)
-	if err := http.ListenAndServeTLS(url, *certFile, *keyFile, nil); err != nil {
-		glog.Error("启动失败", err)
+	http.HandleFunc("/monitor", monitor)
+	url := fmt.Sprintf(":%s", Config.Port)
+	if Config.TLS {
+		glog.Infof("Start TLS service success, visit https://127.0.0.1:%s", Config.Port)
+		if err := http.ListenAndServeTLS(url, Config.CertFile, Config.KeyFile, nil); err != nil {
+			glog.Error("Failed to start", err)
+		}
+	} else {
+		if err := http.ListenAndServe(url, nil); err != nil {
+			glog.Error("Failed to start", err)
+		}
 	}
 
 }
 
-func send(conn *impl2.Connection, msg *impl2.Msg) {
+// Send data to client
+func send(conn *tool.Connection, msg *tool.Msg) {
 	marshal, err := json.Marshal(msg)
 	if err != nil {
-		glog.Errorln("发送数据错误:", err)
+		glog.Errorln("Sending data error:", err)
 		return
 	}
 	if err := conn.WriteMessage(marshal); err != nil {
-		glog.Errorln("发送数据错误:", err)
+		glog.Errorln("Sending data error:", err)
 		return
 	}
 }
 
 // websocket 路由
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	glog.Infoln("开始websocket握手")
 	var (
 		WsConn *websocket.Conn
-		conn   *impl2.Connection
+		conn   *tool.Connection
 		err    error
 		data   []byte
 	)
@@ -72,67 +100,70 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	if WsConn, err = upgrader.Upgrade(w, r, nil); err != nil {
 		return
 	}
-	if conn, err = impl2.IniConnection(WsConn, hub); err != nil {
+	uuid, _ := CurrWorker.NextId()
+	if conn, err = tool.IniConnection(WsConn, uuid, hub); err != nil {
 		goto ERR
 	}
 
 	if id != "" {
 		conn.Id = id
-		conn.Hub.Register <- conn
-		glog.Infoln("绑定用户id成功，id:", id)
+		hub.Register <- conn
+		glog.Infoln("Bind user ID succeeded，id:", id)
 	}
 
 	if room != "" {
 		conn.Room = room
-		conn.Hub.AddRoom <- conn
-		glog.Infoln("绑定房间成功，room:", room)
+		hub.AddRoom <- conn
+		glog.Infoln("Bind room succeeded，room:", room)
 	}
 
 	for {
 		if data, err = conn.ReadMessage(); err != nil {
 			goto ERR
 		}
-		glog.Infoln("接收到消息:", string(data))
-		inData := impl2.Msg{}
+		glog.Infoln("receive message:", string(data))
+		inData := tool.Msg{}
 		err := json.Unmarshal(data, &inData)
 		if err != nil {
-			glog.Errorln("解析数据错误:", err)
+			glog.Errorln("Parsing data error:", err)
 		}
+		// When receiving the heartbeat packet from the client, reply to the heartbeat packet
 		if inData.Event == EventHeartBeat {
 			send(conn, &inData)
 		}
 	}
 ERR:
+	glog.Infoln("close websocket")
 	conn.Close()
 }
 
-// 单推路由
-func sendId(w http.ResponseWriter, r *http.Request) {
+//Push messages to a single user
+func sendById(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	id := r.FormValue("id")
 	data := r.FormValue("data")
 	event := r.FormValue("event")
 	if id == "" {
-		_, err := w.Write([]byte(`{"status":"error","msg":"id 不能为空"}`))
+		_, err := w.Write([]byte(`{"status":"error","msg":"id Cannot be empty"}`))
 		if err != nil {
 			glog.Error(err)
 		}
 		return
 	}
-	msgId := impl2.MsgId{
-		Id: id, Msg: impl2.Msg{
+	msgTmp := tool.MsgTmp{
+		Id: id, Msg: tool.Msg{
 			Event: event,
 			Data:  data,
 		},
 	}
-	hub.Broadcast <- &msgId
+	hub.BroadcastId <- &msgTmp
 	_, err := w.Write([]byte(`{"status":"success"}`))
 	if err != nil {
 		glog.Error(err)
 	}
 }
 
-// 群推路由
+// Push message to room
 func sendRoom(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	room := r.FormValue("room")
@@ -145,14 +176,47 @@ func sendRoom(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	msgRoom := impl2.MsgRoom{
-		Room: room, Msg: impl2.Msg{
+	msgTmp := tool.MsgTmp{
+		Room: room, Msg: tool.Msg{
 			Event: event,
 			Data:  data,
 		},
 	}
-	hub.RoomBroadcast <- &msgRoom
+	hub.BroadcastRoom <- &msgTmp
 	_, err := w.Write([]byte(`{"status":"success"}`))
+	if err != nil {
+		glog.Error(err)
+	}
+}
+
+// monitor
+func monitor(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	var data = make(map[string]interface{})
+	data["connect_num"] = strconv.Itoa(len(hub.Clients))
+	data["BroadcastId_len"] = strconv.Itoa(len(hub.BroadcastId))
+	data["BroadcastRoom_len"] = strconv.Itoa(len(hub.BroadcastRoom))
+	data["Register_len"] = strconv.Itoa(len(hub.Register))
+	data["unregister_buffer"] = strconv.Itoa(len(hub.Unregister))
+	data["AddRoom_buffer"] = strconv.Itoa(len(hub.AddRoom))
+	data["LeaveRoom_buffer"] = strconv.Itoa(len(hub.LeaveRoom))
+	data["mem"] = fmt.Sprintf("%dM", m.Sys/1024/1024)
+	var room = make(map[string]interface{})
+	for index, r := range hub.Rooms {
+		var ids []string
+		for id := range r {
+			ids = append(ids, id.Id)
+		}
+		room[index] = ids
+	}
+	data["room"] = room
+	marshal, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	_, err = w.Write(marshal)
 	if err != nil {
 		glog.Error(err)
 	}
